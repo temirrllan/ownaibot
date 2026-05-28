@@ -1,0 +1,11 @@
+# ВАЖНО: ничего из этого не должно попасть в репозиторий!
+.env
+*.session
+*.session-journal
+dedup.txt
+dedup.tmp
+backfill.done
+__pycache__/
+*.pyc
+.venv/
+venv/

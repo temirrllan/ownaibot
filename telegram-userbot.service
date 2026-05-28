@@ -1,0 +1,27 @@
+[Unit]
+Description=Telegram userbot with AI news filter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ЗАМЕНИТЕ user/пути под свой сервер:
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ownaibot
+ExecStart=/home/ubuntu/ownaibot/.venv/bin/python /home/ubuntu/ownaibot/userbot.py
+
+# Файл .env подхватывается самим скриптом (python-dotenv),
+# но можно дополнительно указать его и здесь:
+EnvironmentFile=-/home/ubuntu/ownaibot/.env
+
+# Автоперезапуск при любом падении
+Restart=always
+RestartSec=10
+
+# Логи идут в journald (см. journalctl ниже)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
