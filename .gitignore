@@ -5,6 +5,7 @@
 dedup.txt
 dedup.tmp
 backfill.done
+monitor.state
 __pycache__/
 *.pyc
 .venv/

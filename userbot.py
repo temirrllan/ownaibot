@@ -55,6 +55,10 @@ API_HASH = os.getenv("API_HASH", "")            # ваш api_hash (строка)
 OPENAI_KEY = os.getenv("OPENAI_KEY", "")        # ключ OpenAI
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+# --- Управляющий бот (токен от @BotFather). Если пусто — бот не запускается,
+#     мониторинг включается автоматически при старте процесса. ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+
 # --- Имя файла сессии Telethon (создаётся при первом входе) ---
 SESSION_NAME = os.getenv("SESSION_NAME", "userbot")
 
@@ -92,6 +96,7 @@ MY_INTERESTS = os.getenv("MY_INTERESTS", """
 BASE_DIR = Path(__file__).resolve().parent
 DEDUP_FILE = BASE_DIR / "dedup.txt"               # отпечатки уже пересланных новостей
 BACKFILL_MARKER = BASE_DIR / "backfill.done"      # маркер выполненной сводки
+STATE_FILE = BASE_DIR / "monitor.state"           # вкл/выкл мониторинг (пульт-бот)
 
 
 # ===========================================================================
@@ -169,6 +174,27 @@ class Dedup:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text("\n".join(self._hashes), encoding="utf-8")
         tmp.replace(self.path)
+
+
+# ===========================================================================
+#               СОСТОЯНИЕ МОНИТОРИНГА (управляется ботом /start /stop)
+# ===========================================================================
+class MonitorState:
+    """
+    Хранит флаг «мониторить или нет» и сохраняет его в файл,
+    чтобы после рестарта процесса состояние не сбрасывалось.
+    """
+
+    def __init__(self, path: Path, default: bool):
+        self.path = path
+        if path.exists():
+            self.enabled = path.read_text(encoding="utf-8").strip() == "on"
+        else:
+            self.enabled = default
+
+    def set(self, value: bool) -> None:
+        self.enabled = value
+        self.path.write_text("on" if value else "off", encoding="utf-8")
 
 
 # ===========================================================================
@@ -325,12 +351,18 @@ async def main() -> None:
     ai = AIFilter(AsyncOpenAI(api_key=OPENAI_KEY), OPENAI_MODEL, MY_INTERESTS)
     dedup = Dedup(DEDUP_FILE, DEDUP_MAX)
 
+    # Если задан BOT_TOKEN — мониторинг по умолчанию ВЫКЛ (ждём /start от пульта).
+    # Если бота нет — мониторим сразу (поведение как раньше).
+    state = MonitorState(STATE_FILE, default=not bool(BOT_TOKEN))
+
     # session — файл рядом со скриптом, чтобы при рестарте не логиниться заново
     client = TelegramClient(str(BASE_DIR / SESSION_NAME), API_ID, API_HASH)
 
-    # --- обработчик новых сообщений в реальном времени ---
+    # --- обработчик новых сообщений в реальном времени (userbot) ---
     @client.on(events.NewMessage)
     async def handler(event):
+        if not state.enabled:
+            return  # мониторинг выключен командой /stop
         try:
             chat = await event.get_chat()
             if not is_broadcast_channel(chat):
@@ -346,11 +378,68 @@ async def main() -> None:
     me = await client.get_me()
     log.info("Вошли как: %s (id=%s)", me.first_name, me.id)
 
-    # стартовая сводка (один раз)
-    await run_backfill(client, ai, dedup)
+    # backfill запускаем в фоне, чтобы он не блокировал приём команд бота
+    async def maybe_backfill():
+        try:
+            await run_backfill(client, ai, dedup)
+        except Exception as e:
+            log.warning("Ошибка backfill: %s", e)
 
-    log.info("Слушаю новые сообщения в реальном времени... (Ctrl+C для выхода)")
-    await client.run_until_disconnected()  # сам реконнектится при обрывах
+    # --- управляющий бот (пульт): /start /stop /status ---
+    if BOT_TOKEN:
+        bot = TelegramClient(str(BASE_DIR / "control_bot"), API_ID, API_HASH)
+
+        def is_owner(event) -> bool:
+            # командам подчиняемся только от владельца userbot (тот же человек)
+            return event.sender_id == me.id
+
+        @bot.on(events.NewMessage(pattern=r"/start"))
+        async def cmd_start(event):
+            if not is_owner(event):
+                return
+            if state.enabled:
+                await event.respond("▶️ Мониторинг уже включён.")
+                return
+            state.set(True)
+            await event.respond(
+                "▶️ Мониторинг включён. Читаю каналы и шлю подходящее в «Избранное»."
+            )
+            log.info("Мониторинг ВКЛючён по команде.")
+            asyncio.create_task(maybe_backfill())  # стартовая сводка, если ещё не было
+
+        @bot.on(events.NewMessage(pattern=r"/stop"))
+        async def cmd_stop(event):
+            if not is_owner(event):
+                return
+            state.set(False)
+            await event.respond("⏹️ Мониторинг остановлен. /start — чтобы включить снова.")
+            log.info("Мониторинг ВЫКЛючён по команде.")
+
+        @bot.on(events.NewMessage(pattern=r"/status"))
+        async def cmd_status(event):
+            if not is_owner(event):
+                return
+            s = "включён ▶️" if state.enabled else "выключен ⏹️"
+            await event.respond(f"Статус мониторинга: {s}")
+
+        await bot.start(bot_token=BOT_TOKEN)
+        bot_me = await bot.get_me()
+        log.info("Пульт-бот запущен: @%s. Команды: /start /stop /status", bot_me.username)
+
+        # если после рестарта мониторинг был включён — досводим (если не было сводки)
+        if state.enabled:
+            asyncio.create_task(maybe_backfill())
+
+        log.info("Жду команды от бота и слушаю каналы...")
+        await asyncio.gather(
+            client.run_until_disconnected(),
+            bot.run_until_disconnected(),
+        )
+    else:
+        # режим без бота: сразу сводка + слушаем каналы (старое поведение)
+        await maybe_backfill()
+        log.info("Слушаю новые сообщения в реальном времени... (Ctrl+C для выхода)")
+        await client.run_until_disconnected()  # сам реконнектится при обрывах
 
 
 if __name__ == "__main__":
