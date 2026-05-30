@@ -301,6 +301,8 @@ async def process_message(client, ai: AIFilter, dedup: Dedup, message, chat) -> 
     """
     text = message.message or ""  # текст сообщения (без медиа-подписей сложных типов)
     if len(text.strip()) < MIN_LEN:
+        log.info("⏭ Коротко, в ИИ не шлём (%s): %d симв.",
+                 channel_title(chat), len(text.strip()))
         return False  # слишком короткое — не тратим запрос к ИИ
 
     if dedup.seen(text):
@@ -309,6 +311,7 @@ async def process_message(client, ai: AIFilter, dedup: Dedup, message, chat) -> 
 
     relevant, reason = await ai.judge(text)
     if not relevant:
+        log.info("⏭ ИИ отклонил (%s): %s", channel_title(chat), reason)
         return False
 
     title = channel_title(chat)
