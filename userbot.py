@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon import TelegramClient, events
-from telethon.tl.types import Channel
+from telethon.tl.types import Channel, MessageMediaWebPage
 from telethon.errors import FloodWaitError
 from openai import AsyncOpenAI, OpenAIError
 
@@ -312,29 +312,37 @@ async def process_message(client, ai: AIFilter, dedup: Dedup, message, chat) -> 
         return False
 
     title = channel_title(chat)
-
-    # короткий отрывок текста поста (чтобы было видно содержимое прямо в подписи)
-    excerpt = text.strip().replace("\n", " ")
-    if len(excerpt) > 350:
-        excerpt = excerpt[:350].rstrip() + "…"
-
+    header = f"📰 Из «{title}»\n🤖 Причина: {reason}"
     link = message_link(chat, message)
+    link_line = f"\n\n🔗 {link}" if link else ""
 
-    # собираем одно самодостаточное сообщение: канал + причина + отрывок + ссылка.
-    # оно стабильно отображается на любом устройстве (в т.ч. на телефоне).
-    caption = f"📰 Из «{title}»\n🤖 Причина: {reason}\n\n{excerpt}"
-    if link:
-        caption += f"\n\n🔗 {link}"
+    # есть ли у поста настоящее медиа (фото/видео/документ), а не просто
+    # превью ссылки. Такое медиа можно отправить копией.
+    media = message.media
+    has_media = media is not None and not isinstance(media, MessageMediaWebPage)
+
+    def _trim(body: str, room: int) -> str:
+        body = body.strip()
+        if len(body) > room:
+            body = body[:room].rstrip() + "…"
+        return body
 
     async def _deliver():
-        # пересылаем оригинал (на десктопе показывает медиа), затем — подпись.
-        # если пересылка не сработает (напр. защищённый контент) — подпись с
-        # текстом и ссылкой всё равно уйдёт.
-        try:
-            await client.forward_messages(TARGET, message)
-        except Exception as e:
-            log.info("Пересылка не удалась (%s), шлём только подпись: %s", title, e)
-        await client.send_message(TARGET, caption, link_preview=False)
+        # Отправляем КОПИЮ поста (а не пересылку): обычное новое сообщение
+        # стабильно видно на телефоне и не зависит от настроек канала.
+        if has_media:
+            # подпись у медиа ограничена ~1024 символами
+            body = _trim(text, 1024 - len(header) - len(link_line) - 4)
+            caption = f"{header}\n\n{body}{link_line}" if body else f"{header}{link_line}"
+            try:
+                await client.send_file(TARGET, media, caption=caption)
+                return
+            except Exception as e:
+                log.info("Медиа не отправилось (%s): %s — шлём текстом", title, e)
+        # текстовый вариант (или фолбэк, если медиа не ушло): до ~4096 символов
+        body = _trim(text, 3900 - len(header) - len(link_line))
+        msg = f"{header}\n\n{body}{link_line}" if body else f"{header}{link_line}"
+        await client.send_message(TARGET, msg, link_preview=False)
 
     try:
         await _deliver()
@@ -344,14 +352,14 @@ async def process_message(client, ai: AIFilter, dedup: Dedup, message, chat) -> 
         await _deliver()
 
     dedup.add(text)
-    log.info("✅ Переслано из «%s»: %s", title, reason)
+    log.info("✅ Отправлено из «%s»: %s", title, reason)
     return True
 
 
 # ===========================================================================
 #                       СТАРТОВАЯ СВОДКА (BACKFILL)
 # ===========================================================================
-async def run_backfill(client, ai: AIFilter, dedup: Dedup) -> None:
+async def run_backfill(client, ai: AIFilter, dedup: Dedup, state) -> None:
     if BACKFILL_MARKER.exists():
         log.info("Маркер сводки найден — backfill пропускаем.")
         return
@@ -361,6 +369,9 @@ async def run_backfill(client, ai: AIFilter, dedup: Dedup) -> None:
     forwarded = 0
 
     async for dialog in client.iter_dialogs():
+        if not state.enabled:
+            log.info("Сводка прервана командой /stop.")
+            return  # маркер НЕ ставим — при следующем /start сводка продолжится
         chat = dialog.entity
         if not is_broadcast_channel(chat):
             continue
@@ -371,6 +382,9 @@ async def run_backfill(client, ai: AIFilter, dedup: Dedup) -> None:
             async for message in client.iter_messages(
                 chat, limit=BACKFILL_LIMIT_PER_CHANNEL
             ):
+                if not state.enabled:
+                    log.info("Сводка прервана командой /stop.")
+                    return
                 if message.date and message.date < since:
                     break  # сообщения идут от новых к старым — дальше только старее
                 count += 1
@@ -434,7 +448,7 @@ async def main() -> None:
     # backfill запускаем в фоне, чтобы он не блокировал приём команд бота
     async def maybe_backfill():
         try:
-            await run_backfill(client, ai, dedup)
+            await run_backfill(client, ai, dedup, state)
         except Exception as e:
             log.warning("Ошибка backfill: %s", e)
 
