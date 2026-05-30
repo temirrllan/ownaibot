@@ -261,6 +261,21 @@ def channel_title(chat) -> str:
     return getattr(chat, "title", None) or getattr(chat, "username", None) or "канал"
 
 
+def message_link(chat, message) -> str | None:
+    """
+    Возвращает ссылку на конкретный пост.
+    Публичный канал: https://t.me/username/123
+    Приватный канал: https://t.me/c/<id>/123 (откроется, если ты подписан)
+    """
+    username = getattr(chat, "username", None)
+    if username:
+        return f"https://t.me/{username}/{message.id}"
+    cid = getattr(chat, "id", None)
+    if cid:
+        return f"https://t.me/c/{cid}/{message.id}"
+    return None
+
+
 async def process_message(client, ai: AIFilter, dedup: Dedup, message, chat) -> bool:
     """
     Общая логика обработки одного сообщения (используется и в backfill,
@@ -279,16 +294,36 @@ async def process_message(client, ai: AIFilter, dedup: Dedup, message, chat) -> 
         return False
 
     title = channel_title(chat)
-    caption = f"📰 Из «{title}»\n🤖 Причина: {reason}"
+
+    # короткий отрывок текста поста (чтобы было видно содержимое прямо в подписи)
+    excerpt = text.strip().replace("\n", " ")
+    if len(excerpt) > 350:
+        excerpt = excerpt[:350].rstrip() + "…"
+
+    link = message_link(chat, message)
+
+    # собираем одно самодостаточное сообщение: канал + причина + отрывок + ссылка.
+    # оно стабильно отображается на любом устройстве (в т.ч. на телефоне).
+    caption = f"📰 Из «{title}»\n🤖 Причина: {reason}\n\n{excerpt}"
+    if link:
+        caption += f"\n\n🔗 {link}"
+
+    async def _deliver():
+        # пересылаем оригинал (на десктопе показывает медиа), затем — подпись.
+        # если пересылка не сработает (напр. защищённый контент) — подпись с
+        # текстом и ссылкой всё равно уйдёт.
+        try:
+            await client.forward_messages(TARGET, message)
+        except Exception as e:
+            log.info("Пересылка не удалась (%s), шлём только подпись: %s", title, e)
+        await client.send_message(TARGET, caption, link_preview=False)
+
     try:
-        # forward_messages сохраняет оригинал; подпись отправляем отдельным сообщением
-        await client.forward_messages(TARGET, message)
-        await client.send_message(TARGET, caption)
+        await _deliver()
     except FloodWaitError as e:
         log.warning("FloodWait %d сек — ждём", e.seconds)
         await asyncio.sleep(e.seconds + 1)
-        await client.forward_messages(TARGET, message)
-        await client.send_message(TARGET, caption)
+        await _deliver()
 
     dedup.add(text)
     log.info("✅ Переслано из «%s»: %s", title, reason)
